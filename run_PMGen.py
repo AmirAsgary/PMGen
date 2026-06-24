@@ -3,7 +3,7 @@ import pandas as pd
 from run_utils import (run_PMGen_wrapper, run_PMGen_modeling, protein_mpnn_wrapper, bioemu_assertions,
                        MultipleAnchors, get_best_structres, retrieve_anchors_and_fixed_positions, assert_iterative_mode,
                        collect_generated_binders, create_new_input_and_fixed_positions, create_fixed_positions_if_given,
-                       mutation_screen, fixed_anchor_pos)
+                       mutation_screen, fixed_anchor_pos, save_peptide_plddt_results)
 import shutil
 from Bio import SeqIO
 import warnings
@@ -87,6 +87,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1, help='ProteinMPNN batch size.')
     parser.add_argument('--hot_spot_thr', type=float, default=6.0, help='Distance threshold to peptide, to define hot-spots on mhc.')
     parser.add_argument('--binder_pred', action='store_true', help='Enables binder prediction from ProteinMPNN generated peptides. It then extracts and reports the best binders.')
+    parser.add_argument('--mpnn_unconditional', action='store_true', help='In addition to peptide sampling, runs ProteinMPNN in unconditional mode to get the per-position '
+                                                                          'amino-acid profile of the peptide (the AA distribution that fits the same geometry). Works with --peptide_design. '
+                                                                          'Outputs go to the peptide_design/unconditional_probs_only folder.')
     parser.add_argument("--fix_anchors", action='store_true', help='If set, does not design anchor positions in peptide generation')
     parser.add_argument("--peptide_random_fix_fraction", type=float, default=0., help="Disables design for a random fraction of amino acids in peptide")
     parser.add_argument('--fixed_positions_given', action='store_true', help="Optional, If enabled, it uses the fixed positions given by user in --df."
@@ -291,6 +294,12 @@ def main():
                 # {'id':[out1, out2], 'id2':[out1, out2], ...}
                 output_pdbs_dict[key] = [os.path.join(value, i) for i in os.listdir(value) if i.endswith('.pdb') and
                                          'model_' in i and not i.endswith('.npy')]
+            # peptide mean pLDDT of every predicted structure -> output_dir/results.csv
+            if not args.only_protein_mpnn and not args.only_mutation_screen and args.no_alphafold:
+                try:
+                    save_peptide_plddt_results(args.output_dir, df)
+                except Exception as e:
+                    print(f'## Warning: could not compute peptide pLDDT results.csv: {e} ##')
             if args.best_structures: # get best structure out of multiple models and multiple predicted anchors:
                 final_df = get_best_structres(args.output_dir, df, args.multiple_anchors)
                 # Request 2: in iterative + multiple_anchors, feed ProteinMPNN ONLY the single

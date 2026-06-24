@@ -951,6 +951,22 @@ def parse_netmhcpan_file(file_path):
     return pd.concat(tables, ignore_index=True)
     
 
+def normalize_allele_for_netmhcpan_match(a: str):
+    """Normalise a full IPD/IMGT allele name to the 2-field, asterisk-free form
+    used for matching against the netMHCpan allele lists.
+
+    e.g. 'HLA-A*03:01:01:02' -> 'HLA-A03:01', 'Mamu-DPA1*02:14:01:01' -> 'Mamu-DPA102:14'.
+    Names that are already short / colon-free (e.g. 'HLA-A0301', 'H-2-Kb') pass through.
+    """
+    if not isinstance(a, str):
+        return a
+    a = a.replace('*', '')
+    if ':' in a:
+        # keep allele-group + protein fields, drop synonymous/non-coding subtype fields
+        a = ':'.join(a.split(':')[:2])
+    return a
+
+
 def find_similar_strings(a: str, file_path: str, num_matches=100):
     # Read the file and store each line as a vocab
     assert a.split('-')[0] in ['HLA', 'DLA', 'SLA', 'Mamu', 'Patr', 'Bola', 'BOLA', 'BoLA', 'MICA', 'MICB', 'mice'], (f''
@@ -1025,7 +1041,18 @@ def match_inputseq_to_netmhcpan_allele(sequence, mhc_type, mhc_allele=None,
         sorted_data = sorted(zip(simple_alleles, sequences, scores),
                              key=lambda x: x[2],  # Sort by score (third element)
                              reverse=True)
-        alleles = [i[0] for i in sorted_data]
+        # The pseudoseq DB stores alleles in the full 4-field asterisk form
+        # (e.g. 'HLA-A*03:01:01:02'). netMHCpan alleles are 2-field and have no
+        # asterisk (e.g. 'HLA-A03:01'). Two problems arise if we pass the raw
+        # 4-field name to find_similar_strings():
+        #   1) the '*' sits between the locus letter and the allele-group digits
+        #      (e.g. '-A*03'), so locus-narrowing regexes like r'-A\d{1,2}' never
+        #      fire and the locus filter is silently skipped.
+        #   2) the extra ':01:02' subtype fields skew the Levenshtein fallback,
+        #      so a spurious allele (e.g. 'HLA-A01:102') can outrank the correct
+        #      one (e.g. 'HLA-A03:01').
+        # Normalising the alignment hits to 2-field, asterisk-free form fixes both.
+        alleles = [normalize_allele_for_netmhcpan_match(i[0]) for i in sorted_data]
         # for each found allele in our db, search in netmhcpan db:
     else:
         alleles = [mhc_allele]
@@ -1485,6 +1512,90 @@ def read_and_extract_core_plddt_from_df_with_anchor(df, output_folder, path_to_a
     print(f'## All best structures saved in {best_structures} ##')
     print(f'## final_df is saved in {os.path.join(output_folder, "final_df.tsv")} ##')
     return final_df
+
+
+def compute_peptide_plddt_results(df, output_folder, path_to_af='alphafold', outfilename='results.csv'):
+    """Compute the peptide mean pLDDT of every predicted structure and write them to <output_folder>/results.csv.
+
+    For each id in `df` and each AlphaFold model produced for it, the peptide pLDDT is
+    taken from the per-residue pLDDT numpy array. The array is ordered MHC-then-peptide
+    and is padded along the sequence dimension, so the peptide slice is
+    arr[mhc_len:mhc_len + pep_len] (NOT arr[-pep_len:], which would read into the padding).
+
+    Args:
+        df: DataFrame with at least the columns 'id', 'peptide', 'mhc_seq' (and optionally 'mhc_type', 'anchors').
+        output_folder: run output directory; results.csv is written at its root.
+        path_to_af: sub-folder (relative to output_folder) holding the per-id AlphaFold outputs.
+        outfilename: name of the csv written inside output_folder.
+    Returns:
+        DataFrame of the per-structure results (also written to disk).
+    """
+    rows = []
+    for _, row in df.iterrows():
+        id = str(row['id'])
+        peptide = str(row['peptide'])
+        mhc_seq = str(row['mhc_seq'])
+        pep_len = len(peptide)
+        mhc_len = len(mhc_seq.replace('/', ''))
+        alphafold_folder = os.path.join(output_folder, path_to_af, id)
+        if not os.path.isdir(alphafold_folder):
+            print(f'## results.csv: no AlphaFold folder for id {id}, skipping ##')
+            continue
+        arrays = [i for i in os.listdir(alphafold_folder) if id in i and i.endswith('_plddt.npy')]
+        if len(arrays) == 0:
+            print(f'## results.csv: no _plddt.npy found for id {id}, skipping ##')
+            continue
+        for arr in sorted(arrays):
+            plddt = np.load(os.path.join(alphafold_folder, arr))
+            peptide_plddt = plddt[mhc_len:mhc_len + pep_len]
+            if len(peptide_plddt) == 0:
+                print(f'## results.csv: empty peptide slice for {arr} (id {id}), skipping ##')
+                continue
+            rows.append({
+                'id': id,
+                'peptide': peptide,
+                'mhc_type': row['mhc_type'] if 'mhc_type' in df.columns else '',
+                'anchors': row['anchors'] if 'anchors' in df.columns else '',
+                'structure': arr.replace('_plddt.npy', '.pdb'),
+                'peptide_mean_plddt': float(np.mean(peptide_plddt)),
+                'overall_mean_plddt': float(np.mean(plddt[:mhc_len + pep_len])),
+            })
+    results_df = pd.DataFrame(rows)
+    out_path = os.path.join(output_folder, outfilename)
+    results_df.to_csv(out_path, index=False)
+    print(f'## Peptide pLDDT results for {len(results_df)} structures saved in {out_path} ##')
+    return results_df
+
+
+def summarize_unconditional_peptide_profile(npz_path, out_csv):
+    """Turn a ProteinMPNN unconditional_probs_only npz into a peptide amino-acid profile CSV.
+
+    The npz holds 'log_p' [B, L, 21] (natural-log probabilities), 'design_mask' [L] (1 for designed,
+    i.e. peptide, positions) and 'S' [L] (native sequence indices). Probabilities are averaged over the
+    batch dimension and restricted to the designed positions, yielding a (peptide_length x 20) table of
+    per-position amino-acid probabilities for the residues that fit the same backbone geometry.
+
+    Returns the profile DataFrame (also written to out_csv).
+    """
+    # ProteinMPNN alphabet (index 20 is 'X', dropped from the profile)
+    alphabet = list('ACDEFGHIKLMNPQRSTVWYX')
+    data = np.load(npz_path)
+    log_p = data['log_p']            # [B, L, 21]
+    probs = np.exp(log_p).mean(axis=0)  # [L, 21] averaged over batch
+    design_mask = data['design_mask'].astype(bool)  # [L]
+    S = data['S']                    # [L] native aa indices
+    pep_idx = np.where(design_mask)[0]
+    rows = []
+    for pos, li in enumerate(pep_idx, start=1):
+        p = probs[li, :20]           # drop 'X'
+        p = p / p.sum() if p.sum() > 0 else p
+        row = {'peptide_position': pos, 'native_aa': alphabet[int(S[li])]}
+        row.update({aa: float(p[k]) for k, aa in enumerate(alphabet[:20])})
+        rows.append(row)
+    profile = pd.DataFrame(rows)
+    profile.to_csv(out_csv, index=False)
+    print(f'## Unconditional peptide profile saved in {out_csv} ##')
+    return profile
 
 
 def alignment_to_string(alignment):
