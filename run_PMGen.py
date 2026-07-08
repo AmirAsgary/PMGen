@@ -90,6 +90,9 @@ def main():
     parser.add_argument('--mpnn_unconditional', action='store_true', help='In addition to peptide sampling, runs ProteinMPNN in unconditional mode to get the per-position '
                                                                           'amino-acid profile of the peptide (the AA distribution that fits the same geometry). Works with --peptide_design. '
                                                                           'Outputs go to the peptide_design/unconditional_probs_only folder.')
+    parser.add_argument('--mpnn_conditional', action='store_true', help='In addition to peptide sampling, runs ProteinMPNN in conditional mode to get the per-position '
+                                                                        'amino-acid profile of the peptide given the rest of the sequence + backbone. Works with --peptide_design. '
+                                                                        'Outputs (profile csv + sequence-logo svg) go to the peptide_design/conditional_probs_only folder.')
     parser.add_argument("--fix_anchors", action='store_true', help='If set, does not design anchor positions in peptide generation')
     parser.add_argument("--peptide_random_fix_fraction", type=float, default=0., help="Disables design for a random fraction of amino acids in peptide")
     parser.add_argument('--fixed_positions_given', action='store_true', help="Optional, If enabled, it uses the fixed positions given by user in --df."

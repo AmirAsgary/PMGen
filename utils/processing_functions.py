@@ -1567,14 +1567,16 @@ def compute_peptide_plddt_results(df, output_folder, path_to_af='alphafold', out
     return results_df
 
 
-def summarize_unconditional_peptide_profile(npz_path, out_csv):
-    """Turn a ProteinMPNN unconditional_probs_only npz into a peptide amino-acid profile CSV.
+def summarize_mpnn_peptide_profile(npz_path, out_csv, label='unconditional'):
+    """Turn a ProteinMPNN (un)conditional_probs_only npz into a peptide amino-acid profile CSV + logo.
 
-    The npz holds 'log_p' [B, L, 21] (natural-log probabilities), 'design_mask' [L] (1 for designed,
-    i.e. peptide, positions) and 'S' [L] (native sequence indices). Probabilities are averaged over the
-    batch dimension and restricted to the designed positions, yielding a (peptide_length x 20) table of
-    per-position amino-acid probabilities for the residues that fit the same backbone geometry.
+    Both the conditional_probs_only and unconditional_probs_only ProteinMPNN outputs share the same npz
+    keys: 'log_p' [B, L, 21] (natural-log probabilities), 'design_mask' [L] (1 for designed, i.e. peptide,
+    positions) and 'S' [L] (native sequence indices). Probabilities are averaged over the batch dimension
+    and restricted to the designed positions, yielding a (peptide_length x 20) table of per-position
+    amino-acid probabilities for the residues that fit the same backbone geometry.
 
+    `label` ('unconditional' or 'conditional') is only used for log messages.
     Returns the profile DataFrame (also written to out_csv).
     """
     # ProteinMPNN alphabet (index 20 is 'X', dropped from the profile)
@@ -1594,8 +1596,93 @@ def summarize_unconditional_peptide_profile(npz_path, out_csv):
         rows.append(row)
     profile = pd.DataFrame(rows)
     profile.to_csv(out_csv, index=False)
-    print(f'## Unconditional peptide profile saved in {out_csv} ##')
+    print(f'## {label.capitalize()} peptide profile saved in {out_csv} ##')
+    # also draw a sequence-logo visualisation next to the csv
+    try:
+        plot_peptide_profile_logo(profile, out_csv.replace('.csv', '.svg'), title=f'{label} peptide profile')
+    except Exception as e:
+        print(f'## Warning: could not draw {label} profile logo: {e} ##')
     return profile
+
+
+# backward-compatible alias
+def summarize_unconditional_peptide_profile(npz_path, out_csv):
+    return summarize_mpnn_peptide_profile(npz_path, out_csv, label='unconditional')
+
+
+def plot_peptide_profile_logo(profile, out_svg, title=None):
+    """Draw a dependency-free sequence-logo SVG of a peptide amino-acid profile.
+
+    `profile` is the DataFrame returned by summarize_mpnn_peptide_profile: one row per
+    peptide position with 20 amino-acid probability columns (and 'peptide_position'/'native_aa').
+    Each position is a stacked column whose letters are sized in proportion to their probability
+    (tallest = most likely), coloured by amino-acid chemistry. Self-contained SVG, no plotting libs.
+    `title` is an optional caption drawn at the top of the figure.
+    """
+    aas = list('ACDEFGHIKLMNPQRSTVWY')
+    # amino-acid colouring by chemistry
+    colors = {}
+    for a in 'AVLIMFWPG': colors[a] = '#1a1a1a'   # hydrophobic / special
+    for a in 'STYNQC':     colors[a] = '#1b9e77'   # polar
+    for a in 'KRH':        colors[a] = '#3173b3'   # positive
+    for a in 'DE':         colors[a] = '#d62728'   # negative
+
+    n = len(profile)
+    col_w, logo_h = 42, 220
+    left, bottom = 48, 46
+    top = 36 if title else 18
+    width = left + n * col_w + 14
+    height = top + logo_h + bottom
+    # monospace glyph metrics (approx, in a 100pt em)
+    F = 100.0; glyph_w = 0.60 * F; cap_h = 0.72 * F
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+           f'font-family="monospace" viewBox="0 0 {width} {height}">',
+           f'<rect width="{width}" height="{height}" fill="white"/>']
+    if title:
+        svg.append(f'<text x="{width/2:.0f}" y="20" font-size="14" font-weight="bold" '
+                   f'fill="#222" text-anchor="middle">{title}</text>')
+    # y axis (probability 0..1)
+    base_y = top + logo_h
+    svg.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{base_y}" stroke="#888" stroke-width="1"/>')
+    for frac in (0.0, 0.5, 1.0):
+        yy = base_y - frac * logo_h
+        svg.append(f'<line x1="{left-4}" y1="{yy:.1f}" x2="{left}" y2="{yy:.1f}" stroke="#888" stroke-width="1"/>')
+        svg.append(f'<text x="{left-7}" y="{yy+4:.1f}" font-size="11" fill="#444" text-anchor="end">{frac:.1f}</text>')
+    svg.append(f'<text x="14" y="{top + logo_h/2:.0f}" font-size="12" fill="#444" '
+               f'transform="rotate(-90 14 {top + logo_h/2:.0f})" text-anchor="middle">probability</text>')
+
+    for i, (_, prow) in enumerate(profile.iterrows()):
+        x0 = left + i * col_w + 4
+        box_w = col_w - 8
+        probs_pos = sorted(((a, float(prow[a])) for a in aas), key=lambda t: t[1])  # ascending: stack small->big
+        y_cursor = base_y
+        for a, p in probs_pos:
+            h = p * logo_h
+            if h < 1.0:
+                continue
+            sx = box_w / glyph_w
+            sy = h / cap_h
+            y_bottom = y_cursor
+            svg.append(
+                f'<g transform="translate({x0:.2f},{y_bottom:.2f}) scale({sx:.4f},{sy:.4f})">'
+                f'<text x="0" y="0" font-size="{F:.0f}" font-weight="bold" '
+                f'fill="{colors.get(a, "#1a1a1a")}">{a}</text></g>')
+            y_cursor -= h
+        # position label + native aa
+        label = str(prow['peptide_position'])
+        svg.append(f'<text x="{x0 + box_w/2:.1f}" y="{base_y + 16:.0f}" font-size="12" '
+                   f'fill="#222" text-anchor="middle">{label}</text>')
+        if 'native_aa' in profile.columns:
+            svg.append(f'<text x="{x0 + box_w/2:.1f}" y="{base_y + 32:.0f}" font-size="12" '
+                       f'fill="#999" text-anchor="middle">{prow["native_aa"]}</text>')
+    svg.append(f'<text x="{left + n*col_w/2:.0f}" y="{height-4}" font-size="12" fill="#444" '
+               f'text-anchor="middle">peptide position (native below)</text>')
+    svg.append('</svg>')
+    with open(out_svg, 'w') as f:
+        f.write('\n'.join(svg))
+    print(f'## Peptide profile logo saved in {out_svg} ##')
+    return out_svg
 
 
 def alignment_to_string(alignment):
